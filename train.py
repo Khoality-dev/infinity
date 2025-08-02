@@ -36,30 +36,25 @@ model = FastModel.get_peft_model(
 )
 
 # System prompts
-TEACHER_SYSTEM_PROMPT = """You are a problem proposer. Generate coding challenges with test cases.
+TEACHER_SYSTEM_PROMPT = """You are a problem proposer, your task is to provide hard coding challenges.
 The 'test_cases' field must contain 5 test cases with inputs and expected outputs.
-Each test case should have 'inputs' (function arguments as dict) and 'output' (expected result).
+Each test case should have 'inputs' (function arguments) and 'output' (expected result).
 
 You can use ```think ``` blocks to reason through problem design before generating your response.
 Output your response in a ```solution ``` block with valid JSON format.
 
-Example format:
-```think
-I need to create a problem about string manipulation. Let me think of a good challenge...
-```
-
-```solution
+Required JSON format:
 {
-  "problem_statement": "Write a function that reverses each word in a sentence while keeping the word order.",
+  "problem_statement": "string - Clear description of the coding problem",
   "test_cases": [
-    {"inputs": {"sentence": "hello world"}, "output": "olleh dlrow"},
-    {"inputs": {"sentence": "python code"}, "output": "nohtyp edoc"},
-    {"inputs": {"sentence": "a b c"}, "output": "a b c"},
-    {"inputs": {"sentence": ""}, "output": ""},
-    {"inputs": {"sentence": "single"}, "output": "elgnis"}
+    {
+      "inputs": {"param_name": value},  // Function arguments as key-value pairs
+      "output": expected_result         // Expected return value (string, int, float, bool, list, or dict)
+    }
+    // ... exactly 5 test cases total
   ]
 }
-```"""
+"""
 
 STUDENT_SYSTEM_PROMPT = """You are a coder. Given a coding challenge, write Python code to solve it.
 Your code must be optimized and clean. If you determine that the problem is impossible to solve 
@@ -68,17 +63,12 @@ or the test cases are inconsistent, set "code" to null and explain why in the ex
 You can use ```think ``` blocks to reason through the problem before providing your solution.
 Output your response in a ```solution ``` block with valid JSON format containing "code" and "explanation" fields.
 
-Example format:
-```think
-I need to reverse each word while keeping word order. I can split by spaces, reverse each word, then join back.
-```
-
-```solution
+Required JSON format:
 {
-  "code": "def reverse_words(sentence):\n    return ' '.join(word[::-1] for word in sentence.split(' '))",
-  "explanation": "Split the sentence by spaces, reverse each word using slicing [::-1], then join back with spaces."
+  "code": "string or null - Complete Python function code that solves the problem",
+  "explanation": "string - Clear explanation of your solution approach and reasoning"
 }
-```"""
+"""
 
 def generate_with_model(messages: List[Dict[str, str]], max_tokens: int = 512) -> str:
     """Generate response using the model"""
@@ -113,25 +103,16 @@ def create_teacher_dataset() -> Dict[str, Any]:
         "prompt": messages
     }
 
-def create_student_dataset(problem_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Create student training data from a problem"""
-    try:
-        # Extract problem from generated text (would need parsing logic)
-        # For now, create a sample problem format
-        test_cases_str = "Sample test cases here"  # This would be parsed from teacher output
-        
-        messages = [
-            {"role": "system", "content": STUDENT_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Problem: Solve this coding challenge\n\nTest Cases:\n{test_cases_str}\n\nPlease provide your solution."}
-        ]
-        
-        return {
-            "prompt": messages,
-            "problem_data": problem_data
-        }
-    except Exception as e:
-        print(f"Error creating student dataset: {e}")
-        return None
+def create_student_dataset(teacher_response: str) -> Dict[str, Any]:
+    """Create student training data from teacher's raw response"""
+    messages = [
+        {"role": "system", "content": STUDENT_SYSTEM_PROMPT},
+        {"role": "user", "content": teacher_response}
+    ]
+    
+    return {
+        "prompt": messages
+    }
 
 # Think block detection and solution block extraction
 def detect_think_blocks(text: str) -> tuple[bool, int]:
@@ -255,14 +236,15 @@ def student_json_format_reward(prompts, completions, **kwargs):
     
     return scores
 
-def student_code_correctness_reward(prompts, completions, problem_data=None, **kwargs):
-    """Reward based on code correctness using test cases"""
+def student_code_correctness_reward(prompts, completions, **kwargs):
+    """Reward based on code correctness - handles fallback cases with penalties"""
     scores = []
     
     for i, (prompt, completion) in enumerate(zip(prompts, completions)):
         score = 0.0
         response = completion[0]["content"]
         
+        # Try to extract JSON from response
         response_data = extract_solution_json(response)
         
         if response_data:
@@ -271,20 +253,36 @@ def student_code_correctness_reward(prompts, completions, problem_data=None, **k
             if code is None:
                 score = -1.0  # Penalty for giving up
             else:
-                # Get test cases for this problem
-                if problem_data and i < len(problem_data):
-                    test_cases = problem_data[i].get("test_cases", [])
-                    if test_cases:
+                # Try to extract test cases from the original prompt if possible
+                try:
+                    prompt_content = prompt[1]["content"] if len(prompt) > 1 else ""
+                    # Try to parse test cases from teacher response in prompt
+                    teacher_data = extract_solution_json(prompt_content)
+                    
+                    if teacher_data and teacher_data.get("test_cases"):
+                        test_cases = teacher_data.get("test_cases", [])
                         # Use our calculate_reward function
                         score = calculate_reward(response, test_cases)
                         # Scale the score (calculate_reward returns 0-1 range)
                         score = score * 4.0  # Scale to 0-4 range for higher weight
                     else:
-                        score = 2.0  # Partial credit for valid code without test cases
-                else:
-                    score = 2.0  # Partial credit when no test cases available
+                        # Fallback: basic syntax check
+                        try:
+                            compile(code, '<string>', 'exec')
+                            score = 1.0  # Reward for valid syntax when no test cases
+                        except SyntaxError:
+                            score = -1.0  # Penalty for syntax errors
+                        except Exception:
+                            score = -0.5  # Smaller penalty for other issues
+                except Exception:
+                    # Ultimate fallback: basic syntax check
+                    try:
+                        compile(code, '<string>', 'exec')
+                        score = 0.5  # Small reward for valid syntax
+                    except:
+                        score = -1.0  # Penalty for invalid code
         else:
-            score = 0.0  # No reward for invalid JSON (handled by format reward)
+            score = -2.0  # Heavy penalty for unparseable response
             
         scores.append(score)
     
@@ -523,7 +521,7 @@ def get_training_args(output_dir, save_steps=10):
         num_generations=4,
         max_prompt_length=max_prompt_length,
         max_completion_length=max_seq_length - max_prompt_length,
-        max_steps=100,  # 100 iterations per training phase
+        max_steps=5,  # 5 iterations per training phase
         save_steps=save_steps,  # Save checkpoint every N steps
         max_grad_norm=0.1,
         report_to="none",
@@ -615,9 +613,13 @@ def train_continuous():
         
         # Generate dynamic dataset for student training
         student_data = []
-        for i in range(100):  # Generate 100 problems for student training
-            teacher_data = create_teacher_dataset()
-            student_sample = create_student_dataset(teacher_data)
+        for i in range(5):  # Generate 5 problems for student training
+            # Generate teacher problem first
+            teacher_prompt = create_teacher_dataset()
+            teacher_response = generate_with_model(teacher_prompt["prompt"])
+            
+            # Create student dataset from teacher's response
+            student_sample = create_student_dataset(teacher_response)
             if student_sample:
                 student_data.append(student_sample)
         
@@ -657,7 +659,7 @@ def train_continuous():
         
         # Generate dynamic dataset for teacher training
         teacher_data = []
-        for i in range(100):  # Generate 100 teacher samples
+        for i in range(5):  # Generate 5 teacher samples
             teacher_sample = create_teacher_dataset()
             teacher_data.append(teacher_sample)
         
